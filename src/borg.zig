@@ -1,6 +1,12 @@
 const std = @import("std");
 const testing = std.testing;
 
+pub const cgroup = @import("cgroup.zig");
+
+test {
+    testing.refAllDecls(@This());
+}
+
 // Helps cleanup uname strings into a format that std.SemanticVersion
 // can accept.
 pub fn parse_dirty_semver(dirty_release: []const u8) !std.SemanticVersion {
