@@ -7,8 +7,7 @@ test {
     testing.refAllDecls(@This());
 }
 
-// Helps cleanup uname strings into a format that std.SemanticVersion
-// can accept.
+// Cleans up uname strings for use with std.SemanticVersion.
 pub fn parse_dirty_semver(dirty_release: []const u8) !std.SemanticVersion {
     const release = blk: {
         var last_valid_char_index: usize = 0;

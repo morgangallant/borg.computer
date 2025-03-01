@@ -15,11 +15,13 @@ pub fn build(b: *std.Build) void {
         .name = "borg",
         .root_module = borg_lib,
     });
+    lib.linkLibC();
     b.installArtifact(lib);
 
     const lib_unit_tests = b.addTest(.{
         .root_module = borg_lib,
     });
+    lib_unit_tests.linkLibC();
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
