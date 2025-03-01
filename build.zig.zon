@@ -1,0 +1,11 @@
+.{
+    .name = "borg",
+    .version = "0.0.0",
+    .minimum_zig_version = "0.14.0-dev.3223+13ad984b1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
