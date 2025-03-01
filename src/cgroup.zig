@@ -39,8 +39,6 @@ test "current pid" {
 
 // Returns a space-seperated list of active controllers for the given cgroup.
 pub fn controllers(gpa: std.mem.Allocator, cgroup: []const u8) ![]const u8 {
-    assert(std.fs.path.isAbsolute(cgroup));
-
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(
         &buf,
@@ -71,18 +69,13 @@ test "controllers" {
 
     const valid_controllers = std.StaticStringMap(void).initComptime(.{
         .{ "cpu", {} },
-        .{ "cpuacct", {} },
         .{ "cpuset", {} },
-        .{ "devices", {} },
-        .{ "freezer", {} },
         .{ "memory", {} },
-        .{ "net_cls", {} },
-        .{ "net_prio", {} },
         .{ "perf_event", {} },
         .{ "pids", {} },
         .{ "rdma", {} },
-        .{ "blkio", {} },
         .{ "hugetlb", {} },
+        .{ "io", {} },
     });
 
     var iterator = std.mem.tokenizeAny(u8, current_controllers, " ");
@@ -109,11 +102,17 @@ pub fn move_into(cgroup: []const u8, pid: std.posix.pid_t) !void {
 // Create a new cgroup. If move is set, the given pid will be moved into the new cgroup.
 pub fn create(cgroup: []const u8, child: []const u8, move: ?std.posix.pid_t) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}", .{ cgroup, child });
+    const path = if (cgroup.len > 0)
+        try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}", .{ cgroup, child })
+    else
+        try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}", .{child});
     try std.fs.cwd().makePath(path);
 
     if (move) |pid| {
-        const pid_path = try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}/cgroup.procs", .{ cgroup, child });
+        const pid_path = if (cgroup.len > 0)
+            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}/cgroup.procs", .{ cgroup, child })
+        else
+            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/cgroup.procs", .{child});
         const file = try std.fs.cwd().openFile(pid_path, .{ .mode = .write_only });
         defer file.close();
         try file.writer().print("{}", .{pid});
@@ -210,4 +209,46 @@ test "clone3" {
     defer allocator.free(actual_child_cgroup_name);
 
     try testing.expectEqualSlices(u8, new_cgroup_name, actual_child_cgroup_name);
+}
+
+// Configures the set of controllers for a cgroup.
+// `v` should be a valid format for "cgroup.subtree_control"
+// See: https://docs.kernel.org/admin-guide/cgroup-v2.html#controlling-controllers
+pub fn configure_controllers(cgroup: []const u8, v: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &buf,
+        "/sys/fs/cgroup{s}/cgroup.subtree_control",
+        .{cgroup},
+    );
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .write_only });
+    defer file.close();
+    try file.writer().writeAll(v);
+}
+
+pub fn enable_all_controllers(gpa: std.mem.Allocator, cgroup: []const u8) !void {
+    const raw = try controllers(gpa, cgroup);
+    defer gpa.free(raw);
+
+    var builder = std.ArrayList(u8).init(gpa);
+    defer builder.deinit();
+
+    var it = std.mem.splitScalar(u8, raw, ' ');
+    while (it.next()) |controller| {
+        if (controller.len == 0) continue;
+        try builder.append('+');
+        try builder.appendSlice(controller);
+        if (it.rest().len > 0) try builder.append(' ');
+    }
+
+    try configure_controllers(cgroup, builder.items);
+}
+
+test "configure controllers" {
+    // TODO need to figure out how this should work, i.e. the current bash
+    // process only has a few controllers enabled, but we need to enable all
+    // of the controllers for the cgroup that we create. Sub-cgroups inherit
+    // the controllers of their parent, so as it stands right now, we can't
+    // use all the cgroup controllers on the system if we make a new cgroup
+    // that's a child of the current cgroup.
 }
