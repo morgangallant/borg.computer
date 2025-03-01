@@ -2,7 +2,7 @@ const std = @import("std");
 const testing = std.testing;
 
 // Helps cleanup uname strings into a format that std.SemanticVersion
-// can accept. Credit: Tigerbeetle
+// can accept.
 pub fn parse_dirty_semver(dirty_release: []const u8) !std.SemanticVersion {
     const release = blk: {
         var last_valid_char_index: usize = 0;
