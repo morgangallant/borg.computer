@@ -99,20 +99,31 @@ pub fn move_into(cgroup: []const u8, pid: std.posix.pid_t) !void {
     try file.writer().print("{}", .{pid});
 }
 
-// Create a new cgroup. If move is set, the given pid will be moved into the new cgroup.
-pub fn create(cgroup: []const u8, child: []const u8, move: ?std.posix.pid_t) !void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path = if (cgroup.len > 0)
-        try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}", .{ cgroup, child })
-    else
-        try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}", .{child});
-    try std.fs.cwd().makePath(path);
+const CreateOptions = struct {
+    // If set, the given pid will be moved into the new cgroup.
+    move_pid: ?std.posix.pid_t = null,
 
-    if (move) |pid| {
-        const pid_path = if (cgroup.len > 0)
-            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}/cgroup.procs", .{ cgroup, child })
+    // If set, the cgroup will be created as a child of the specified parent cgroup.
+    parent: ?[]const u8 = null,
+};
+
+// Create a new cgroup. If move is set, the given pid will be moved into the new cgroup.
+pub fn create(name: []const u8, options: CreateOptions) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = blk: {
+        if (options.parent) |parent| {
+            assert(parent.len > 0 and parent[0] == '/');
+            break :blk try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}", .{ parent, name });
+        }
+        assert(name.len > 0 and name[0] == '/');
+        break :blk try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}", .{name});
+    };
+    try std.fs.cwd().makePath(path);
+    if (options.move_pid) |pid| {
+        const pid_path = if (options.parent) |parent|
+            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/{s}/cgroup.procs", .{ parent, name })
         else
-            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/cgroup.procs", .{child});
+            try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/cgroup.procs", .{name});
         const file = try std.fs.cwd().openFile(pid_path, .{ .mode = .write_only });
         defer file.close();
         try file.writer().print("{}", .{pid});
@@ -184,31 +195,31 @@ pub fn clone_into(cgroup: []const u8) !std.posix.pid_t {
     };
 }
 
-test "clone3" {
-    // This test doesn't work with the testing allocator,
-    // requires the libc allocator.
+test "clone_into" {
+    // fork'ing (or equiv. clone3) doesn't play nicely with the testing allocator.
+    // We need to use the libc allocator instead.
     const allocator = std.heap.c_allocator;
 
-    const current_pid = std.os.linux.getpid();
-    const current_cgroup = (try current(allocator, current_pid)).?;
-    defer allocator.free(current_cgroup);
+    const cgroup_name = "/test_clone_into";
 
-    try create(current_cgroup, "test_clone3", null);
-    const new_cgroup_name = try std.fmt.allocPrint(allocator, "{s}/test_clone3", .{current_cgroup});
-    defer allocator.free(new_cgroup_name);
+    // Cleanup from previous test runs
+    // TODO is it possible to cleanup after ourselves after we're done?
+    // if we defer a cleanup, we get EBUSY since the child is still running
+    try delete_if_exists(cgroup_name);
 
-    const pid = try clone_into(new_cgroup_name);
+    try create(cgroup_name, .{});
+
+    const pid = try clone_into(cgroup_name);
     if (pid != 0) {
-        return; // Parent process will return instantly.
+        // We're in the parent process, exit immediately
+        return;
     }
 
-    // Make sure the current cgroup of the child is what we expect.
-
-    const child_current = std.os.linux.getpid();
-    const actual_child_cgroup_name = (try current(allocator, child_current)).?;
-    defer allocator.free(actual_child_cgroup_name);
-
-    try testing.expectEqualSlices(u8, new_cgroup_name, actual_child_cgroup_name);
+    // Make sure the cgroup of the child is what we expect.
+    const child_pid = std.os.linux.getpid();
+    const child_cgroup = (try current(allocator, child_pid)).?;
+    defer allocator.free(child_cgroup);
+    try testing.expectEqualStrings(child_cgroup, cgroup_name);
 }
 
 // Configures the set of controllers for a cgroup.
@@ -226,6 +237,26 @@ pub fn configure_controllers(cgroup: []const u8, v: []const u8) !void {
     try file.writer().writeAll(v);
 }
 
+pub fn enabled_controllers(gpa: std.mem.Allocator, cgroup: []const u8) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &buf,
+        "/sys/fs/cgroup{s}/cgroup.subtree_control",
+        .{cgroup},
+    );
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
+    defer file.close();
+
+    var reader = std.io.bufferedReader(file.reader());
+    const contents = try reader.reader().readAllAlloc(gpa, 1 << 20);
+    defer gpa.free(contents);
+
+    const result = std.mem.trimRight(u8, contents, " \r\n");
+    return try gpa.dupe(u8, result);
+}
+
+// For all controllers that are delegated to the selected cgroup,
+// enable them all by writing to the cgroup.subtree_control file.
 pub fn enable_all_controllers(gpa: std.mem.Allocator, cgroup: []const u8) !void {
     const raw = try controllers(gpa, cgroup);
     defer gpa.free(raw);
@@ -244,11 +275,55 @@ pub fn enable_all_controllers(gpa: std.mem.Allocator, cgroup: []const u8) !void 
     try configure_controllers(cgroup, builder.items);
 }
 
+// Delete the cgroup if it exists.
+pub fn delete_if_exists(cgroup: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}", .{cgroup});
+    std.fs.cwd().deleteDir(path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+pub fn convert_to_threaded_if_needed(gpa: std.mem.Allocator, cgroup: []const u8) !void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, "/sys/fs/cgroup{s}/cgroup.type", .{cgroup});
+    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer file.close();
+
+    var reader = std.io.bufferedReader(file.reader());
+    const contents = try reader.reader().readAllAlloc(gpa, 1 << 20);
+    defer gpa.free(contents);
+
+    if (std.mem.startsWith(u8, contents, "domain invalid")) {
+        try file.writeAll("threaded");
+    }
+}
+
 test "configure controllers" {
-    // TODO need to figure out how this should work, i.e. the current bash
-    // process only has a few controllers enabled, but we need to enable all
-    // of the controllers for the cgroup that we create. Sub-cgroups inherit
-    // the controllers of their parent, so as it stands right now, we can't
-    // use all the cgroup controllers on the system if we make a new cgroup
-    // that's a child of the current cgroup.
+    const allocator = testing.allocator;
+
+    const cgroup_name = "/test_configure_controllers";
+
+    // Cleanup from previous test runs
+    // ... And cleanup after ourselves after we're done
+    try delete_if_exists(cgroup_name);
+    defer delete_if_exists(cgroup_name) catch |err| {
+        std.log.warn("failed to delete cgroup after test: {}", .{err});
+    };
+
+    try create(cgroup_name, .{});
+
+    const available_controllers = try controllers(allocator, cgroup_name);
+    defer allocator.free(available_controllers);
+
+    const enabled_controllers_before = try enabled_controllers(allocator, cgroup_name);
+    defer allocator.free(enabled_controllers_before);
+    try testing.expectEqualStrings(enabled_controllers_before, "");
+
+    try enable_all_controllers(allocator, cgroup_name);
+
+    const enabled_controllers_after = try enabled_controllers(allocator, cgroup_name);
+    defer allocator.free(enabled_controllers_after);
+    try testing.expectEqualStrings(enabled_controllers_after, available_controllers);
 }

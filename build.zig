@@ -18,8 +18,10 @@ pub fn build(b: *std.Build) void {
     lib.linkLibC();
     b.installArtifact(lib);
 
+    const test_filter = b.option([]const []const u8, "test_filter", "Filter tests by name") orelse &[_][]const u8{};
     const lib_unit_tests = b.addTest(.{
         .root_module = borg_lib,
+        .filters = test_filter,
     });
     lib_unit_tests.linkLibC();
 
